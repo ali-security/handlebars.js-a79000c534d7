@@ -439,6 +439,30 @@ describe('precompiler', function() {
       expect(output).to.not.match(/\['evil'\];global\.__xjpjName=1/);
     });
 
+    it('should escape script tag delimiters in template names', function() {
+      var name = '</script><script>alert(1)</script><!--';
+      var output = runCliAndCaptureOutput({
+        templates: [{ name: name, source: '' }]
+      });
+
+      expect(output).to.not.match(/<(!--|\/?script)/i);
+      var quotedName = output.match(/templates\[("(?:[^"\\]|\\.)*")\]/);
+      expect(JSON.parse(quotedName[1])).to.equal(name);
+    });
+
+    it('should escape line separators in template names', function() {
+      var name =
+        'a' + String.fromCharCode(0x2028) + 'b' + String.fromCharCode(0x2029);
+      var output = runCliAndCaptureOutput({
+        templates: [{ name: name, source: '' }]
+      });
+
+      expect(output).to.not.contain(String.fromCharCode(0x2028));
+      expect(output).to.not.contain(String.fromCharCode(0x2029));
+      var quotedName = output.match(/templates\[("(?:[^"\\]|\\.)*")\]/);
+      expect(JSON.parse(quotedName[1])).to.equal(name);
+    });
+
     it('should not inject raw commonjs option values into generated code', function() {
       var output = runCliAndCaptureOutput({
         templates: [{ name: 'safe', source: '' }],
@@ -484,6 +508,46 @@ describe('precompiler', function() {
       expect(output).to.not.match(
         /sourceMappingURL=[^\n]*\n;global\.__xjpjMap=1/
       );
+    });
+
+    function runCliWithSourceMap(options) {
+      var oldWriteFileSync = fs.writeFileSync;
+      fs.writeFileSync = function() {};
+      try {
+        return runCliAndCaptureOutput(options);
+      } finally {
+        fs.writeFileSync = oldWriteFileSync;
+      }
+    }
+
+    it('should sanitize sourceMappingURL comment values when minifying', function() {
+      var output = runCliWithSourceMap({
+        templates: [{ name: 'safe', path: 'safe.handlebars', source: 'x' }],
+        min: true,
+        map: 'good.js.map\n;global.__xjpjMinMap=1;//'
+      });
+
+      expect(output).to.contain(
+        'sourceMappingURL=good.js.map;global.__xjpjMinMap=1;//'
+      );
+      expect(output).to.not.match(
+        /sourceMappingURL=[^\n]*\n;global\.__xjpjMinMap=1/
+      );
+    });
+
+    it('should percent-encode "<" in sourceMappingURL comment values', function() {
+      [false, true].forEach(function(min) {
+        var output = runCliWithSourceMap({
+          templates: [{ name: 'safe', path: 'safe.handlebars', source: 'x' }],
+          min: min,
+          map: '</script><!--<script>.map'
+        });
+
+        expect(output).to.contain(
+          'sourceMappingURL=%3C/script>%3C!--%3Cscript>.map'
+        );
+        expect(output).to.not.match(/<(!--|\/?script)/i);
+      });
     });
   });
 });
