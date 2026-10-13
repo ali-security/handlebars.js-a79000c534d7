@@ -472,12 +472,17 @@ describe('security issues', function() {
     });
   });
 
-  describe('GHSA-2w6w-674q-4c4q, GHSA-xhpv-hc6g-r9c6, GHSA-3mfm-83xf-c92r: untrusted AST inputs', function() {
+  describe('GHSA-2w6w-674q-4c4q, GHSA-xhpv-hc6g-r9c6, GHSA-3mfm-83xf-c92r, GHSA-8r5x-fm3f-whwj: untrusted AST inputs', function() {
     if (!Handlebars.compile) {
       return;
     }
 
     function createInjectedProgram() {
+      var loc = {
+        source: null,
+        start: { line: 1, column: 0 },
+        end: { line: 1, column: 20 }
+      };
       return {
         type: 'Program',
         body: [
@@ -488,12 +493,14 @@ describe('security issues', function() {
               open: false,
               close: false
             },
+            loc: loc,
             path: {
               type: 'PathExpression',
               data: false,
               depth: 0,
               parts: ['lookup'],
-              original: 'lookup'
+              original: 'lookup',
+              loc: loc
             },
             params: [
               {
@@ -501,12 +508,14 @@ describe('security issues', function() {
                 data: false,
                 depth: 0,
                 parts: [],
-                original: 'this'
+                original: 'this',
+                loc: loc
               },
               {
                 type: 'NumberLiteral',
                 value: '{},{})) + (Function) + (({}',
-                original: 1
+                original: 1,
+                loc: loc
               }
             ]
           }
@@ -515,10 +524,12 @@ describe('security issues', function() {
     }
 
     it('should reject AST NumberLiteral type confusion in compile()', function() {
+      // NumberLiteral.value is emitted as a raw JavaScript literal, so the
+      // compiler rejects anything that is not a number.
       expect(function() {
         var template = Handlebars.compile(createInjectedProgram());
         template({});
-      }).to.throw(/Invalid AST/);
+      }).to.throw(/Invalid AST: NumberLiteral value must be a number/);
     });
 
     it('should reject AST objects passed via dynamic partial lookup', function() {
@@ -527,7 +538,313 @@ describe('security issues', function() {
         template({
           payload: createInjectedProgram()
         });
-      }).to.throw(/Invalid AST|could not be found/);
+      }).to.throw(/could not be found/);
+    });
+
+    it('should reject a non-integer param depth in stringParams mode', function() {
+      // pushParam passes val.depth to the getContext opcode. In stringParams
+      // mode, getContext stores the depth in lastContext, which contextName
+      // interpolates into generated code as 'depths[' + depth + ']'. A depth
+      // that is not a non-negative integer is therefore rejected.
+      var loc = {
+        source: null,
+        start: { line: 1, column: 0 },
+        end: { line: 1, column: 20 }
+      };
+      var maliciousAST = {
+        type: 'Program',
+        body: [
+          {
+            type: 'MustacheStatement',
+            escaped: true,
+            strip: { open: false, close: false },
+            loc: loc,
+            path: {
+              type: 'PathExpression',
+              data: false,
+              depth: 0,
+              parts: ['lookup'],
+              original: 'lookup',
+              loc: loc
+            },
+            params: [
+              {
+                type: 'PathExpression',
+                data: false,
+                depth: 'function(){throw new Error("INJECTION")}()',
+                parts: [],
+                original: '',
+                loc: loc
+              }
+            ]
+          }
+        ]
+      };
+
+      expect(function() {
+        var template = Handlebars.compile(maliciousAST, {
+          stringParams: true
+        });
+        template({});
+      }).to.throw(
+        /Invalid AST: PathExpression depth must be a non-negative integer/
+      );
+    });
+
+    it('should reject non-array blockParams', function() {
+      // The compiler reads program.blockParams.length from the AST and
+      // javascript-compiler.js interpolates that value verbatim into a
+      // container.program(...) call. blockParams must therefore be an array
+      // of strings, so that the length is always a safe integer.
+      var maliciousAST = {
+        type: 'Program',
+        loc: { start: { line: 1, column: 0 } },
+        body: [
+          {
+            type: 'BlockStatement',
+            path: {
+              type: 'PathExpression',
+              data: false,
+              depth: 0,
+              parts: ['rce'],
+              original: 'rce',
+              loc: { start: { line: 1, column: 0 } }
+            },
+            params: [],
+            program: {
+              type: 'Program',
+              blockParams: {
+                length: "(()=>{throw new Error('INJECTION')})()"
+              },
+              body: [],
+              loc: { start: { line: 1, column: 0 } }
+            },
+            openStrip: { open: false, close: false },
+            inverseStrip: { open: false, close: false },
+            closeStrip: { open: false, close: false },
+            loc: { start: { line: 1, column: 0 } }
+          }
+        ]
+      };
+
+      expect(function() {
+        var template = Handlebars.compile(maliciousAST, {
+          stringParams: true
+        });
+        template({});
+      }).to.throw(/Invalid AST: Program blockParams must be an array/);
+    });
+
+    it('should reject non-number NumberLiteral values in stringParams mode', function() {
+      // In stringParams mode, pushStringParam emits any non-string param
+      // value as a raw literal, and the code generator concatenates array
+      // chunks verbatim. The NumberLiteral handler therefore rejects any
+      // value that is not a number.
+      var loc = {
+        source: null,
+        start: { line: 1, column: 0 },
+        end: { line: 1, column: 20 }
+      };
+      var maliciousAST = {
+        type: 'Program',
+        body: [
+          {
+            type: 'MustacheStatement',
+            escaped: true,
+            strip: { open: false, close: false },
+            loc: loc,
+            path: {
+              type: 'PathExpression',
+              data: false,
+              depth: 0,
+              parts: ['helper'],
+              original: 'helper',
+              loc: loc
+            },
+            params: [
+              {
+                type: 'NumberLiteral',
+                value: ['(function(){throw new Error("INJECTION")})()'],
+                original: 1,
+                loc: loc
+              }
+            ]
+          }
+        ]
+      };
+
+      expect(function() {
+        var template = Handlebars.compile(maliciousAST, {
+          stringParams: true
+        });
+        template({});
+      }).to.throw(/Invalid AST: NumberLiteral value must be a number/);
+    });
+
+    it('should reject non-array blockParams with default options', function() {
+      // Program.blockParams.length is interpolated into the generated
+      // container.program(...) call regardless of the compile options.
+      var maliciousAST = {
+        type: 'Program',
+        body: [
+          {
+            type: 'BlockStatement',
+            path: {
+              type: 'PathExpression',
+              data: false,
+              depth: 0,
+              parts: ['missingHelper'],
+              original: 'missingHelper'
+            },
+            params: [],
+            program: {
+              type: 'Program',
+              blockParams: {
+                length: '(function(){throw new Error("INJECTION")})()'
+              },
+              body: []
+            },
+            openStrip: { open: false, close: false },
+            inverseStrip: { open: false, close: false },
+            closeStrip: { open: false, close: false }
+          }
+        ]
+      };
+
+      expect(function() {
+        Handlebars.compile(maliciousAST)({});
+      }).to.throw(/Invalid AST: Program blockParams must be an array/);
+
+      if (Handlebars.precompile) {
+        expect(function() {
+          Handlebars.precompile(maliciousAST);
+        }).to.throw(/Invalid AST: Program blockParams must be an array/);
+      }
+    });
+
+    it('should reject non-string StringLiteral and non-boolean BooleanLiteral values in stringParams mode', function() {
+      function createLiteralParamAST(type) {
+        return {
+          type: 'Program',
+          body: [
+            {
+              type: 'MustacheStatement',
+              escaped: true,
+              strip: { open: false, close: false },
+              path: {
+                type: 'PathExpression',
+                data: false,
+                depth: 0,
+                parts: ['helper'],
+                original: 'helper'
+              },
+              params: [
+                {
+                  type: type,
+                  value: ['(function(){throw new Error("INJECTION")})()'],
+                  original: 'x'
+                }
+              ]
+            }
+          ]
+        };
+      }
+
+      expect(function() {
+        Handlebars.compile(createLiteralParamAST('StringLiteral'), {
+          stringParams: true
+        })({});
+      }).to.throw(/Invalid AST: StringLiteral value must be a string/);
+
+      expect(function() {
+        Handlebars.compile(createLiteralParamAST('BooleanLiteral'), {
+          stringParams: true
+        })({});
+      }).to.throw(/Invalid AST: BooleanLiteral value must be a boolean/);
+    });
+
+    it('should not emit a non-string PathExpression original as code in stringParams mode', function() {
+      // In stringParams mode a PathExpression param is not visited by its
+      // node handler: its `original` becomes the string param value, so a
+      // non-string `original` must be stringified, not emitted as code.
+      var payload = '(function(){throw new Error("INJECTION")})()';
+      var maliciousAST = {
+        type: 'Program',
+        body: [
+          {
+            type: 'MustacheStatement',
+            escaped: false,
+            strip: { open: false, close: false },
+            path: {
+              type: 'PathExpression',
+              data: false,
+              depth: 0,
+              parts: ['helper'],
+              original: 'helper'
+            },
+            params: [
+              {
+                type: 'PathExpression',
+                data: false,
+                depth: 0,
+                parts: ['foo'],
+                original: [payload]
+              }
+            ]
+          }
+        ]
+      };
+
+      var template = Handlebars.compile(maliciousAST, { stringParams: true });
+      equal(
+        template(
+          {},
+          {
+            helpers: {
+              helper: function(value) {
+                return typeof value + ':' + value;
+              }
+            }
+          }
+        ),
+        'string:' + payload
+      );
+    });
+
+    it('should reject a non-integer depth on a literal param in stringParams mode', function() {
+      // pushParam validates the depth of every param type, not only of
+      // PathExpressions, because it is interpolated as depths[<depth>].
+      var maliciousAST = {
+        type: 'Program',
+        body: [
+          {
+            type: 'MustacheStatement',
+            escaped: true,
+            strip: { open: false, close: false },
+            path: {
+              type: 'PathExpression',
+              data: false,
+              depth: 0,
+              parts: ['helper'],
+              original: 'helper'
+            },
+            params: [
+              {
+                type: 'StringLiteral',
+                value: 'x',
+                original: 'x',
+                depth: '0,(function(){throw new Error("INJECTION")})()'
+              }
+            ]
+          }
+        ]
+      };
+
+      expect(function() {
+        Handlebars.compile(maliciousAST, { stringParams: true })({});
+      }).to.throw(
+        /Invalid AST: StringLiteral depth must be a non-negative integer/
+      );
     });
   });
 
