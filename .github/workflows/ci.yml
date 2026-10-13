@@ -1,15 +1,19 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - master
-  pull_request: {}
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional mocha grep pattern; empty runs the full suite'
+        required: false
+        default: ''
 
 jobs:
   lint:
     name: Lint
     runs-on: 'ubuntu-latest'
+    if: false
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,12 +32,13 @@ jobs:
   test:
     name: Test (Node)
     runs-on: ${{ matrix.operating-system }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         operating-system: ['ubuntu-latest', 'windows-latest']
         # https://nodejs.org/en/about/releases/
-        node-version: ['16', '18', '20', '22']
+        node-version: ['10', '16', '18', '20', '22']
 
     steps:
       - name: Checkout
@@ -50,7 +55,13 @@ jobs:
         run: npm ci
 
       - name: Test
-        run: npm run test
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npx grunt build && node ./spec/env/runner.js "${{ inputs.test-filter }}"
+          else
+            npm run test
+          fi
 
       - name: Test (Integration)
         # https://github.com/webpack/webpack/issues/14532
@@ -60,9 +71,26 @@ jobs:
           cd ./tests/integration/webpack-babel-test && ./test.sh && cd -
           cd ./tests/integration/webpack-test && ./test.sh && cd -
 
+      - name: Build release dist
+        if: ${{ matrix.operating-system == 'ubuntu-latest' && matrix.node-version == '10' }}
+        run: npx grunt uglify test:min copy:dist
+
+      - name: Pack
+        if: ${{ matrix.operating-system == 'ubuntu-latest' && matrix.node-version == '10' }}
+        run: npm pack
+
+      - name: Upload tarball
+        if: ${{ matrix.operating-system == 'ubuntu-latest' && matrix.node-version == '10' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: handlebars-tgz
+          path: handlebars-*.tgz
+          if-no-files-found: error
+
   browser:
     name: Test (Browser)
     runs-on: 'ubuntu-22.04'
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -87,3 +115,176 @@ jobs:
 
       - name: Test
         run: npm run test:browser
+
+  test-legacy-node:
+    name: Test (Node 0.4)
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npx grunt build
+
+      - name: Compile Node 0.4.12 from source
+        shell: bash
+        run: |
+          # centos:7 = gcc 4.8.5 + python 2.7 (V8 3.1 built with gcc >= 4.9 segfaults).
+          # --without-ssl: the binary must run on the Ubuntu host (no libssl.so.10).
+          mkdir -p "$RUNNER_TEMP/node04"
+          curl -fsSL --retry 3 https://nodejs.org/dist/v0.4.12/node-v0.4.12.tar.gz -o "$RUNNER_TEMP/node04/node-v0.4.12.tar.gz"
+          cat > "$RUNNER_TEMP/node04/build.sh" <<'EOF'
+          set -e
+          # CentOS 7 is EOL: use the vault, with archive.kernel.org as yum failover.
+          rm -f /etc/yum.repos.d/*.repo
+          printf '%s\n' '[base]' 'name=CentOS-7.9.2009 - Base' \
+            'baseurl=https://vault.centos.org/7.9.2009/os/x86_64/' \
+            '        https://archive.kernel.org/centos-vault/7.9.2009/os/x86_64/' \
+            'gpgcheck=1' 'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7' > /etc/yum.repos.d/vault.repo
+          yum install -y -q gcc gcc-c++ make which
+          cd /tmp
+          tar xzf /out/node-v0.4.12.tar.gz
+          cd node-v0.4.12
+          ./configure --prefix=/opt/node04 --without-ssl
+          make -j2
+          make install
+          cp /opt/node04/bin/node /out/node
+          EOF
+          docker run --rm -v "$RUNNER_TEMP/node04:/out" centos:7 bash /out/build.sh
+          "$RUNNER_TEMP/node04/node" -v
+
+      - name: Install Node 0.4-compatible test frameworks
+        shell: bash
+        run: |
+          # Never run npm under Node 0.4: install with Node 16 into an isolated dir,
+          # then overlay into spec/node_modules (resolved before root node_modules).
+          mkdir -p "$RUNNER_TEMP/legacy"
+          cd "$RUNNER_TEMP/legacy"
+          echo '{"name":"legacy","version":"1.0.0","private":true}' > package.json
+          npm install --no-audit --no-fund --ignore-scripts mocha@1.21.5 chai@3.5.0 dirty-chai@1.2.2 sinon@1.17.7 readable-stream@1.0.34
+          cd "$GITHUB_WORKSPACE"
+          rm -rf spec/node_modules
+          cp -a "$RUNNER_TEMP/legacy/node_modules" spec/node_modules
+          # Harness-only polyfills for Node 0.4 (no lib/ or spec/*.js changes); lives in
+          # spec/node_modules so its requires resolve the downgraded frameworks.
+          cat > spec/node_modules/legacy-shim.js <<'SHIM'
+          /* eslint-disable */
+          // Node 0.4 polyfills for the test HARNESS only (no lib/ or spec/ changes).
+          //
+          // This file is copied into spec/node_modules/ at test time, next to the
+          // downgraded test frameworks (mocha 1.21.5, chai 3.5.0, dirty-chai 1.2.2,
+          // sinon 1.17.7, readable-stream 1.0.34), so its require() calls resolve them.
+          //
+          // Usage: node04 spec/node_modules/legacy-shim.js ["<mocha grep filter>"]
+          var path = require('path');
+          var fs = require('fs');
+          var stream = require('stream');
+          var Module = require('module');
+
+          // path.sep was added in Node 0.8 (spec/env/runner.js)
+          if (!path.sep) { path.sep = '/'; }
+
+          // require() of .json was added in Node 0.5 (spec/spec.js loads mustache specs)
+          if (!require.extensions['.json']) {
+            require.extensions['.json'] = function(module, filename) {
+              module.exports = JSON.parse(fs.readFileSync(filename, 'utf8'));
+            };
+          }
+
+          // streams2 stream.Readable was added in Node 0.10 (mock-stdin needs it).
+          // readable-stream@1.0 expects require('stream') to be the Stream constructor;
+          // on Node 0.4 it is { Stream: Stream }.
+          if (!stream.Readable) {
+            var origLoad = Module._load;
+            Module._load = function(request, parent) {
+              if (request === 'stream' && parent && /readable-stream/.test(parent.filename)) {
+                return stream.Stream;
+              }
+              return origLoad.apply(this, arguments);
+            };
+            stream.Readable = require('readable-stream').Readable;
+          }
+
+          // sinon >= 5 cannot be parsed by V8 3.1 ("yield:" property in strict mode), so
+          // sinon 1.17 is used; add the sinon 5 default-sandbox API the specs rely on:
+          // sinon.restore() (no args) and sinon.replace(obj, prop, fn).
+          var sinon = require('sinon');
+          if (!sinon.replace) {
+            var fakes = [];
+            var origWrap = sinon.wrapMethod;
+            var origRestore = sinon.restore;
+            sinon.wrapMethod = function() {
+              var m = origWrap.apply(this, arguments);
+              fakes.push(m);
+              return m;
+            };
+            sinon.replace = function(obj, prop, replacement) {
+              var original = obj[prop];
+              var owned = Object.prototype.hasOwnProperty.call(obj, prop);
+              obj[prop] = replacement;
+              fakes.push({ restore: function() {
+                if (owned) { obj[prop] = original; } else { delete obj[prop]; }
+              } });
+              return replacement;
+            };
+            sinon.restore = function(obj) {
+              if (arguments.length) { return origRestore.apply(this, arguments); }
+              while (fakes.length) {
+                var f = fakes.pop();
+                if (f && typeof f.restore === 'function') { f.restore(); }
+              }
+            };
+          }
+
+          // Excluded on Node 0.4 only: V8 3.1 reports
+          // Object.prototype.hasOwnProperty.call({}, '__proto__') === true, so
+          // lookupProperty() treats __proto__ as an own property and returns the
+          // prototype ("[object Object]") instead of ''. Engine limitation, not harness.
+          //
+          // The exclusion is composed with any user grep filter (process.argv[2], which
+          // runner.js passes to mocha.grep): mocha 1.21's Runner constructor calls
+          // this.grep(/.*/) and Mocha#run calls runner.grep(userRe, invert), so wrapping
+          // Runner#grep applies the exclusion with and without a filter.
+          var EXCLUDE = /GH-1595: dangerous properties access should be denied to \{\{(__proto__|lookup this "__proto__")\}\}/;
+          var Runner = require('mocha').Runner;
+          var origGrep = Runner.prototype.grep;
+          Runner.prototype.grep = function(userRe, userInvert) {
+            var matcher = {
+              test: function(title) {
+                var userMatch = userRe ? userRe.test(title) !== !!userInvert : true;
+                return userMatch && !EXCLUDE.test(title);
+              }
+            };
+            return origGrep.call(this, matcher, false);
+          };
+
+          require('../env/runner.js');
+          SHIM
+          # uglify-js >= 3.13 cannot be parsed by V8 3.1; dist/cjs/precompiler
+          # resolves it from the root node_modules, so swap it there.
+          rm -rf node_modules/uglify-js
+          mkdir node_modules/uglify-js
+          curl -fsSL https://registry.npmjs.org/uglify-js/-/uglify-js-3.12.8.tgz | tar xz -C node_modules/uglify-js --strip-components=1
+
+      - name: Test (Node 0.4)
+        shell: bash
+        run: |
+          set -o pipefail
+          # Pipe through cat: on Node 0.4, process.exit() truncates stdout written
+          # to a file, losing the mocha summary lines.
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            "$RUNNER_TEMP/node04/node" spec/node_modules/legacy-shim.js "${{ inputs.test-filter }}" 2>&1 | cat
+          else
+            "$RUNNER_TEMP/node04/node" spec/node_modules/legacy-shim.js 2>&1 | cat
+          fi
